@@ -1,151 +1,100 @@
-// Подключаем CUDA runtime API (cudaMalloc, cudaMemcpy, cudaDeviceSynchronize и т.д.)
 #include <cuda_runtime.h>
-
-// Подключаем потоковый вывод в консоль
 #include <iostream>
-
-// Подключаем контейнер vector для удобной работы с массивами на CPU
 #include <vector>
-
-// Подключаем алгоритмы стандартной библиотеки (sort, make_heap, sort_heap, is_sorted)
-#include <algorithm>
-
-// Подключаем генератор случайных чисел
 #include <random>
-
-// Подключаем библиотеку для измерения времени
+#include <algorithm>
 #include <chrono>
 
-// Даём псевдоним типу таймера для удобства
-using clk = std::chrono::high_resolution_clock;
+#define CUDA_CHECK(x) do { if((x)!=cudaSuccess){ \
+    std::cout<<"CUDA error\n"; exit(1);} } while(0)
 
+// ================= GPU HEAPSORT (from part 3) =================
 
-
-// ==========================
-// ===== CPU СОРТИРОВКИ =====
-// ==========================
-
-// Последовательная быстрая сортировка на CPU (используем std::sort)
-void cpuQuick(std::vector<int>& a) {
-    // std::sort реализует эффективную гибридную quicksort / introsort
-    std::sort(a.begin(), a.end());
+__device__ __forceinline__ void siftDown(int* a, int n, int idx) {
+    while (true) {
+        int left = 2 * idx + 1;
+        if (left >= n) break;
+        int right = left + 1;
+        int largest = (right < n && a[right] > a[left]) ? right : left;
+        if (a[idx] >= a[largest]) break;
+        int t = a[idx]; a[idx] = a[largest]; a[largest] = t;
+        idx = largest;
+    }
 }
 
-// Последовательная пирамидальная сортировка на CPU
-void cpuHeap(std::vector<int>& a) {
-    // Превращаем массив в кучу
+__global__ void heapifyKernel(int* a, int n, int start) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x + start;
+    if (i < n / 2) siftDown(a, n, i);
+}
+
+__global__ void swapKernel(int* a, int end) {
+    int t = a[0]; a[0] = a[end]; a[end] = t;
+}
+
+__global__ void fixRoot(int* a, int n) {
+    siftDown(a, n, 0);
+}
+
+void gpuHeapSort(int* d, int n) {
+    int threads = 256;
+    int blocks = (n/2 + threads - 1) / threads;
+    heapifyKernel<<<blocks, threads>>>(d, n, 0);
+    cudaDeviceSynchronize();
+
+    for (int end = n - 1; end > 0; --end) {
+        swapKernel<<<1,1>>>(d, end);
+        fixRoot<<<1,1>>>(d, end);
+        cudaDeviceSynchronize();
+    }
+}
+
+// ================= CPU HEAPSORT =================
+
+void cpuHeapSort(std::vector<int>& a) {
     std::make_heap(a.begin(), a.end());
-    // Извлекаем элементы из кучи, формируя отсортированный массив
     std::sort_heap(a.begin(), a.end());
 }
 
+// ================= BENCHMARK =================
 
+void runTest(int N) {
+    std::vector<int> data(N);
+    std::mt19937 rng(42);
+    for (int& x : data) x = rng();
 
-// ==========================
-// ===== ИЗМЕРЕНИЕ ВРЕМЕНИ =====
-// ==========================
+    std::vector<int> cpu = data;
 
-// Шаблонная функция, измеряющая время выполнения переданной функции
-template<class F>
-double time_ms(F f) {
-    // Фиксируем время начала выполнения
-    auto t1 = clk::now();
-    // Выполняем измеряемую функцию
-    f();
-    // Фиксируем время окончания выполнения
-    auto t2 = clk::now();
-    // Возвращаем разницу во времени в миллисекундах
-    return std::chrono::duration<double, std::milli>(t2 - t1).count();
+    auto c1 = std::chrono::high_resolution_clock::now();
+    cpuHeapSort(cpu);
+    auto c2 = std::chrono::high_resolution_clock::now();
+    double cpuTime = std::chrono::duration<double, std::milli>(c2 - c1).count();
+
+    int* d;
+    CUDA_CHECK(cudaMalloc(&d, N * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d, data.data(), N * sizeof(int), cudaMemcpyHostToDevice));
+
+    cudaEvent_t g1, g2;
+    cudaEventCreate(&g1); cudaEventCreate(&g2);
+
+    cudaEventRecord(g1);
+    gpuHeapSort(d, N);
+    cudaEventRecord(g2);
+    cudaEventSynchronize(g2);
+
+    float gpuTime;
+    cudaEventElapsedTime(&gpuTime, g1, g2);
+
+    cudaMemcpy(data.data(), d, N * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(d);
+
+    std::cout << "N = " << N 
+              << " | CPU: " << cpuTime << " ms"
+              << " | GPU: " << gpuTime << " ms"
+              << " | Speedup: " << cpuTime / gpuTime << "x\n";
 }
 
-
-
-// ==========================
-// ===== GPU ОБЁРТКИ =====
-// ==========================
-
-// Объявляем функцию GPU-версии быстрой сортировки
-void gpuQuick(std::vector<int>& a);
-
-// Объявляем функцию GPU-версии пирамидальной сортировки
-void gpuHeap(std::vector<int>& a);
-
-
-
-// ==========================
-// ===== ТЕСТИРОВАНИЕ =====
-// ==========================
-
-// Функция тестирования для массива размера N
-void test(int N) {
-    // Создаём базовый массив на CPU
-    std::vector<int> base(N);
-
-    // Создаём генератор случайных чисел
-    std::mt19937 rng(1);
-
-    // Диапазон случайных значений
-    std::uniform_int_distribution<int> d(0, 1000000);
-
-    // Заполняем массив случайными числами
-    for (int i = 0; i < N; ++i)
-        base[i] = d(rng);
-
-    // Копируем массив для CPU quicksort
-    auto a = base;
-
-    // Измеряем время CPU quicksort
-    double tq = time_ms([&]() { cpuQuick(a); });
-
-    // Восстанавливаем массив
-    a = base;
-
-    // Измеряем время CPU heapsort
-    double th = time_ms([&]() { cpuHeap(a); });
-
-    // Восстанавливаем массив
-    a = base;
-
-    // Измеряем время GPU quicksort
-    double gq = time_ms([&]() { gpuQuick(a); });
-
-    // Восстанавливаем массив
-    a = base;
-
-    // Измеряем время GPU heapsort
-    double gh = time_ms([&]() { gpuHeap(a); });
-
-    // Выводим размер теста
-    std::cout << "\nN = " << N << "\n";
-
-    // Выводим время CPU quicksort
-    std::cout << "CPU Quick: " << tq << " ms\n";
-
-    // Выводим время CPU heapsort
-    std::cout << "CPU Heap : " << th << " ms\n";
-
-    // Выводим время GPU quicksort
-    std::cout << "GPU Quick: " << gq << " ms\n";
-
-    // Выводим время GPU heapsort
-    std::cout << "GPU Heap : " << gh << " ms\n";
-}
-
-
-
-// ==========================
-// ===== MAIN =====
-// ==========================
-
-// Главная функция программы
 int main() {
-
-    // Тест для 10 тысяч элементов
-    test(10000);
-
-    // Тест для 100 тысяч элементов
-    test(100000);
-
-    // Тест для 1 миллиона элементов
-    test(1000000);
+    runTest(10000);
+    runTest(100000);
+    runTest(1000000);
 }

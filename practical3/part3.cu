@@ -1,120 +1,126 @@
-#include <cuda_runtime.h>      // CUDA runtime API
-#include <iostream>           // вывод на консоль
-#include <algorithm>          // std::is_sorted
-#include <random>             // генератор случайных чисел
+#include <cuda_runtime.h>
+#include <iostream>
+#include <vector>
+#include <random>
+#include <algorithm>
+#include <cassert>
 
-// Макрос проверки ошибок CUDA
-#define CUDA_CHECK(call) do {                                        \
-    cudaError_t e = (call);                                          \
-    if (e != cudaSuccess) {                                          \
-        std::cerr << "CUDA error: " << cudaGetErrorString(e)         \
-                  << " at " << __FILE__ << ":" << __LINE__ << "\n"; \
-        std::exit(1);                                                \
-    }                                                                \
-} while(0)
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err = (call);                                             \
+        if (err != cudaSuccess) {                                             \
+            std::cerr << "CUDA error: " << cudaGetErrorString(err)            \
+                      << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
+            std::exit(1);                                                     \
+        }                                                                     \
+    } while (0)
 
-// Количество потоков в блоке
-#define BLOCK 256
+static inline int floor_log2_u32(unsigned x) {
+    int r = 0;
+    while (x >>= 1) ++r;
+    return r;
+}
 
-// ------------------------------
-// Устройство: операция siftDown
-// ------------------------------
-__device__ void siftDown(int* data, int start, int end)
-{
-    int root = start;                         // индекс корня подкучи
-
+__device__ __forceinline__ void siftDown(int* a, int n, int idx) {
     while (true) {
-        int child = 2 * root + 1;            // левый потомок
+        int left = 2 * idx + 1;
+        if (left >= n) break;
+        int right = left + 1;
 
-        if (child > end) break;              // если потомков нет — конец
+        int largest = idx;
+        int lv = a[left];
+        int av = a[largest];
+        if (lv > av) largest = left;
 
-        if (child + 1 <= end && data[child] < data[child + 1])
-            child++;                          // выбираем большего потомка
-
-        if (data[root] < data[child]) {
-            int tmp = data[root];            // меняем root и потомка
-            data[root] = data[child];
-            data[child] = tmp;
-            root = child;                    // продолжаем вниз
-        } else {
-            break;                           // свойство кучи выполнено
+        if (right < n) {
+            int rv = a[right];
+            av = a[largest];
+            if (rv > av) largest = right;
         }
+
+        if (largest == idx) break;
+
+        int tmp = a[idx];
+        a[idx] = a[largest];
+        a[largest] = tmp;
+
+        idx = largest;
     }
 }
 
-// ------------------------------
-// CUDA kernel: параллельное построение кучи
-// ------------------------------
-__global__ void buildHeap(int* data, int n)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // глобальный индекс
+__global__ void heapifyLevelKernel(int* a, int n, int levelStart, int levelCount) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= levelCount) return;
+    int idx = levelStart + t;
+    siftDown(a, n, idx);
+}
 
-    // Все внутренние узлы начинаются с n/2 - 1 до 0
-    int start = n / 2 - 1 - idx;
+__global__ void swapRootWithEndKernel(int* a, int endIdx) {
+    int tmp = a[0];
+    a[0] = a[endIdx];
+    a[endIdx] = tmp;
+}
 
-    if (start >= 0) {
-        siftDown(data, start, n - 1);       // каждый поток heapify своего узла
+__global__ void siftDownRootKernel(int* a, int heapSize) {
+    siftDown(a, heapSize, 0);
+}
+
+void gpuHeapSort(int* d_a, int n) {
+    if (n <= 1) return;
+
+    int lastInternal = (n / 2) - 1;
+    if (lastInternal >= 0) {
+        int lastInternalDepth = floor_log2_u32((unsigned)(lastInternal + 1));
+        constexpr int THREADS = 256;
+
+        for (int depth = lastInternalDepth; depth >= 0; --depth) {
+            int levelStart = (1 << depth) - 1;
+            int levelEnd = (1 << (depth + 1)) - 2;
+            if (levelStart > lastInternal) continue;
+            if (levelEnd > lastInternal) levelEnd = lastInternal;
+
+            int levelCount = levelEnd - levelStart + 1;
+            int blocks = (levelCount + THREADS - 1) / THREADS;
+
+            heapifyLevelKernel<<<blocks, THREADS>>>(d_a, n, levelStart, levelCount);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    }
+
+    for (int end = n - 1; end >= 1; --end) {
+        swapRootWithEndKernel<<<1, 1>>>(d_a, end);
+        CUDA_CHECK(cudaGetLastError());
+
+        siftDownRootKernel<<<1, 1>>>(d_a, end);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 }
 
-// ------------------------------
-// CUDA kernel: извлечение максимума (частично параллельно)
-// ------------------------------
-__global__ void heapSortKernel(int* data, int n)
-{
-    for (int i = n - 1; i > 0; --i) {        // основной цикл извлечения
-        if (threadIdx.x == 0) {
-            int tmp = data[0];              // переносим максимум в конец
-            data[0] = data[i];
-            data[i] = tmp;
-        }
-        __syncthreads();                    // синхронизация потоков
+int main() {
+    const int N = 1000000;
+    std::vector<int> h(N);
 
-        // Параллельное просеивание после удаления корня
-        if (threadIdx.x == 0) {
-            siftDown(data, 0, i - 1);
-        }
-        __syncthreads();
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> dist(-1000000, 1000000);
+    for (int i = 0; i < N; ++i) h[i] = dist(rng);
+
+    int* d_a = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_a, N * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_a, h.data(), N * sizeof(int), cudaMemcpyHostToDevice));
+
+    gpuHeapSort(d_a, N);
+
+    CUDA_CHECK(cudaMemcpy(h.data(), d_a, N * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_a));
+
+    if (!std::is_sorted(h.begin(), h.end())) {
+        std::cerr << "Sort FAILED\n";
+        return 1;
     }
-}
 
-// ------------------------------
-// HOST main
-// ------------------------------
-int main()
-{
-    const int N = 4096;                      // размер массива
-
-    int* h = new int[N];                    // host-массив
-
-    std::mt19937 rng(123);                  // генератор
-    std::uniform_int_distribution<int> d(0, 100000);
-
-    for (int i = 0; i < N; i++)             // заполняем массив
-        h[i] = d(rng);
-
-    int* d_data;                            // device-массив
-    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(int)));
-
-    CUDA_CHECK(cudaMemcpy(d_data, h, N * sizeof(int), cudaMemcpyHostToDevice));
-
-    // Параллельное построение кучи
-    int blocks = (N / 2 + BLOCK - 1) / BLOCK;
-    buildHeap<<<blocks, BLOCK>>>(d_data, N);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Основная сортировка
-    heapSortKernel<<<1, BLOCK>>>(d_data, N);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h, d_data, N * sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Проверка
-    if (std::is_sorted(h, h + N))
-        std::cout << "Heap sort on CUDA: OK\n";
-    else
-        std::cout << "Heap sort FAILED\n";
-
-    delete[] h;
-    cudaFree(d_data);
+    std::cout << "Sort OK\n";
+    return 0;
 }
