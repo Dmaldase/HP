@@ -1,133 +1,96 @@
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
+// merge_sort_cuda.cu
 
+#include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
-#include <algorithm>
 #include <random>
+#include <algorithm>
 
-// Безопасные значения почти для любой CUDA-видеокарты
-#define CHUNK_SIZE 256
-#define THREADS    256
+#define CHUNK 1024
+#define THREADS 256
 
-// Печать ошибки с КОДОМ и текстом
-#define CUDA_CHECK(call) do {                                                \
-    cudaError_t e = (call);                                                  \
-    if (e != cudaSuccess) {                                                  \
-        std::cerr << "CUDA error code=" << (int)e                            \
-                  << " msg=" << cudaGetErrorString(e)                        \
-                  << " at " << __FILE__ << ":" << __LINE__ << "\n";          \
-        std::exit(1);                                                        \
-    }                                                                        \
-} while(0)
+__global__ void bitonicSortBlock(int* data, int n) {
+    __shared__ int s[CHUNK];
 
-__device__ __forceinline__ void dswap(int& a, int& b) {
-    int t = a; a = b; b = t;
-}
+    int start = blockIdx.x * CHUNK;
+    int tid = threadIdx.x;
 
-// Каждый блок сортирует свой чанк odd-even сортировкой
-__global__ void sortChunks(int* data, int n) {
-
-    __shared__ int buf[CHUNK_SIZE];
-
-    int blockStart = (int)blockIdx.x * CHUNK_SIZE;
-    int tid = (int)threadIdx.x;
-
-    int blockSize = n - blockStart;
-    if (blockSize > CHUNK_SIZE) blockSize = CHUNK_SIZE;
-    if (blockSize <= 0) return;
-
-    if (tid < blockSize)
-        buf[tid] = data[blockStart + tid];
+    if (start + tid < n)
+        s[tid] = data[start + tid];
+    else
+        s[tid] = INT_MAX;
 
     __syncthreads();
 
-    for (int step = 0; step < blockSize; ++step) {
-        if (((tid & 1) == (step & 1)) && (tid + 1 < blockSize)) {
-            if (buf[tid] > buf[tid + 1]) dswap(buf[tid], buf[tid + 1]);
+    for (int k = 2; k <= CHUNK; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            int i = tid;
+            int ixj = i ^ j;
+            if (ixj > i && ixj < CHUNK) {
+                if ((s[i] > s[ixj]) == ((i & k) == 0)) {
+                    int tmp = s[i];
+                    s[i] = s[ixj];
+                    s[ixj] = tmp;
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
-    if (tid < blockSize)
-        data[blockStart + tid] = buf[tid];
+    if (start + tid < n)
+        data[start + tid] = s[tid];
 }
 
-// CPU merge: right exclusive
-void merge(std::vector<int>& arr, int left, int mid, int right) {
-    std::vector<int> temp(right - left);
-    int i = left, j = mid, k = 0;
+__global__ void mergePass(int* in, int* out, int n, int width) {
+    int start = blockIdx.x * 2 * width;
+    int i = start;
+    int j = start + width;
+    int end1 = min(start + width, n);
+    int end2 = min(start + 2 * width, n);
 
-    while (i < mid && j < right)
-        temp[k++] = (arr[i] < arr[j]) ? arr[i++] : arr[j++];
+    int k = start + threadIdx.x;
+    while (k < end2) {
+        int a = (i < end1) ? in[i] : INT_MAX;
+        int b = (j < end2) ? in[j] : INT_MAX;
+        out[k] = (a < b) ? (i++, a) : (j++, b);
+        k += blockDim.x;
+    }
+}
 
-    while (i < mid) temp[k++] = arr[i++];
-    while (j < right) temp[k++] = arr[j++];
+void gpuMergeSort(int* d, int n) {
+    int* temp;
+    cudaMalloc(&temp, n * sizeof(int));
 
-    std::copy(temp.begin(), temp.end(), arr.begin() + left);
+    int blocks = (n + CHUNK - 1) / CHUNK;
+    bitonicSortBlock<<<blocks, CHUNK>>>(d, n);
+
+    for (int width = CHUNK; width < n; width *= 2) {
+        int pairs = (n + 2 * width - 1) / (2 * width);
+        mergePass<<<pairs, THREADS>>>(d, temp, n, width);
+        std::swap(d, temp);
+    }
+
+    cudaFree(temp);
 }
 
 int main() {
-    // 1) Проверяем, что CUDA вообще видит устройство
-    int devCount = 0;
-    CUDA_CHECK(cudaGetDeviceCount(&devCount));
-    if (devCount == 0) {
-        std::cerr << "CUDA devices not found (devCount=0)\n";
-        return 1;
-    }
-    CUDA_CHECK(cudaSetDevice(0));
+    int N = 10000;
+    std::vector<int> h(N);
 
-    // 2) Печатаем базовую инфу по GPU (чтобы понимать ограничения)
-    cudaDeviceProp prop{};
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    std::cout << "GPU: " << prop.name
-              << "  maxThreadsPerBlock=" << prop.maxThreadsPerBlock
-              << "  sharedPerBlock=" << prop.sharedMemPerBlock << "\n";
+    std::mt19937 gen;
+    std::uniform_int_distribution<> dist(1, 100000);
 
-    const int N = 1 << 20; // ~1,048,576
+    for (int i = 0; i < N; ++i) h[i] = dist(gen);
 
-    std::vector<int> arr(N);
-    std::mt19937 gen(0);
-    for (int& x : arr) x = (int)gen();
+    int* d;
+    cudaMalloc(&d, N * sizeof(int));
+    cudaMemcpy(d, h.data(), N * sizeof(int), cudaMemcpyHostToDevice);
 
-    int* d_arr = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_arr, (size_t)N * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_arr, arr.data(), (size_t)N * sizeof(int), cudaMemcpyHostToDevice));
+    gpuMergeSort(d, N);
 
-    int blocks = (N + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    cudaMemcpy(h.data(), d, N * sizeof(int), cudaMemcpyDeviceToHost);
 
-    sortChunks<<<blocks, THREADS>>>(d_arr, N);
+    std::cout << "Sorted: " << std::is_sorted(h.begin(), h.end()) << std::endl;
 
-    // 3) Ловим ошибку запуска ядра
-    CUDA_CHECK(cudaGetLastError());
-
-    // 4) Ловим runtime-ошибки выполнения ядра
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(arr.data(), d_arr, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Диагностика: проверим, что каждый чанк отсортирован
-    for (int b = 0; b < blocks; ++b) {
-        int L = b * CHUNK_SIZE;
-        int R = std::min(L + CHUNK_SIZE, N);
-        if (!std::is_sorted(arr.begin() + L, arr.begin() + R)) {
-            std::cout << "Chunk sort FAILED at block " << b << "\n";
-            CUDA_CHECK(cudaFree(d_arr));
-            return 1;
-        }
-    }
-
-    // CPU merge
-    for (int size = CHUNK_SIZE; size < N; size *= 2) {
-        for (int left = 0; left < N; left += 2 * size) {
-            int mid = std::min(left + size, N);
-            int right = std::min(left + 2 * size, N);
-            merge(arr, left, mid, right);
-        }
-    }
-
-    std::cout << (std::is_sorted(arr.begin(), arr.end()) ? "Sorting OK\n" : "Sorting FAILED\n");
-
-    CUDA_CHECK(cudaFree(d_arr));
-    return 0;
+    cudaFree(d);
 }
